@@ -2,23 +2,20 @@ package microbatch
 
 import (
 	"errors"
-	"fmt"
 	"sync"
 	"time"
 )
 
 type Batcher struct {
-	processor BatchProcessor
-	size      int
-	frequency time.Duration
-	mu        sync.Mutex
-	jobs      []BatchedJob
-	ready     chan bool
-	ticker    *time.Ticker
-	closed    bool
-}
-
-type batch struct {
+	processor   BatchProcessor
+	size        int
+	frequency   time.Duration
+	shutdownMux sync.Mutex
+	jobsMux     sync.Mutex
+	jobs        []BatchedJob
+	ready       chan bool
+	ticker      *time.Ticker
+	closed      bool
 }
 
 type Job struct {
@@ -29,40 +26,39 @@ type Job struct {
 type BatchedJob struct {
 	job      Job
 	resultCh chan interface{}
+	errCh    chan error
 }
 
 type JobResult struct {
-	result interface{}
-	error  error
-	once   sync.Once
-	ch     chan interface{}
+	result   interface{}
+	error    error
+	once     sync.Once
+	resultCh chan interface{}
+	errCh    chan error
 }
 
-func (jr *JobResult) Get() interface{} {
+func (jr *JobResult) Get() (interface{}, error) {
 	jr.once.Do(func() {
-		jr.result = <-jr.ch
+		select {
+		case err := <-jr.errCh:
+			jr.error = err
+		case result := <-jr.resultCh:
+			jr.result = result
+		}
 	})
 
-	return jr.result
+        if jr.error != nil {
+                return nil, jr.error
+        } else {
+	        return jr.result, nil
+        }
 }
 
 type BatchProcessor interface {
-	Process(Job) interface{}
+	Process(Job) (interface{}, error)
 }
 
-func BatchSize(size int) func(*Batcher) {
-	return func(b *Batcher) {
-		b.size = size
-	}
-}
-
-func ProcessFrequency(f time.Duration) func(*Batcher) {
-	return func(b *Batcher) {
-		b.frequency = f
-	}
-}
-
-func NewBatcher(bp BatchProcessor, options ...func(*Batcher)) *Batcher {
+func NewBatcher(bp BatchProcessor, options ...optfunc) *Batcher {
 	b := &Batcher{
 		processor: bp,
 		ready:     make(chan bool),
@@ -81,8 +77,7 @@ func NewBatcher(bp BatchProcessor, options ...func(*Batcher)) *Batcher {
 			case <-b.ticker.C:
 			case <-b.ready:
 			}
-                        b.processBatch()
-
+			b.processBatch()
 		}
 	}()
 
@@ -90,9 +85,6 @@ func NewBatcher(bp BatchProcessor, options ...func(*Batcher)) *Batcher {
 }
 
 func (b *Batcher) processBatch() {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
 	var length int
 
 	if len(b.jobs) < b.size {
@@ -101,31 +93,41 @@ func (b *Batcher) processBatch() {
 		length = b.size
 	}
 
+	b.jobsMux.Lock()
+	defer b.jobsMux.Unlock()
+
 	if length > 0 {
-		go b.processJobs(b.jobs[:(length - 1)])
+		go b.processJobs(b.jobs[:length])
 	}
 
-	fmt.Println("length: ", length)
 	b.jobs = b.jobs[length:]
 }
 
 func (b *Batcher) processJobs(jobs []BatchedJob) {
 	for _, bj := range jobs {
-		bj.resultCh <- b.processor.Process(bj.job)
+                result, err := b.processor.Process(bj.job)
+                if err != nil {
+                        bj.errCh <- err
+                } else {
+		        bj.resultCh <- result
+                }
 	}
 
 }
 
 func (b *Batcher) Submit(j Job) (JobResult, error) {
 	resultCh := make(chan interface{}, 1)
-	bj := BatchedJob{j, resultCh}
+	errCh := make(chan error, 1)
+	bj := BatchedJob{j, resultCh, errCh}
 
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
+	b.shutdownMux.Lock()
+	defer b.shutdownMux.Unlock()
 	if b.closed == true {
 		return JobResult{}, errors.New("batcher was shutdown")
 	}
+
+	b.jobsMux.Lock()
+	defer b.jobsMux.Unlock()
 
 	b.jobs = append(b.jobs, bj)
 
@@ -133,12 +135,12 @@ func (b *Batcher) Submit(j Job) (JobResult, error) {
 		b.ready <- true
 	}
 
-	return JobResult{once: sync.Once{}, ch: resultCh}, nil
+	return JobResult{once: sync.Once{}, resultCh: resultCh, errCh: errCh}, nil
 }
 
 func (b *Batcher) Shutdown() {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+	b.shutdownMux.Lock()
+	defer b.shutdownMux.Unlock()
 
 	b.closed = true
 
