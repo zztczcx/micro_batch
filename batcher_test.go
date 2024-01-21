@@ -23,9 +23,9 @@ func Test_Submit(t *testing.T) {
         job1 := Job{content: "job1"}
         job2 := Job{content: "job2"}
         job3 := Job{content: "job3"}
-        result1 := batcher.Submit(job1)
-        result2 := batcher.Submit(job2)
-        result3 := batcher.Submit(job3)
+        result1, _ := batcher.Submit(job1)
+        result2, _ := batcher.Submit(job2)
+        result3, _ := batcher.Submit(job3)
 
         time.Sleep(1*time.Second)
         if result1.Get() != "job1" {
